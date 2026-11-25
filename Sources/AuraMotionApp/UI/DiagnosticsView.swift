@@ -72,7 +72,7 @@ public struct DiagnosticsView: View {
                             context.stroke(path, with: .color(raw ? .orange : .cyan), lineWidth: 1.5)
                         }
                     }.frame(height: 70)
-                    Text(String(format: "Index confidence: %.0f%%", Double(snapshot?.sample?.joints[.indexTip]?.confidence ?? 0) * 100))
+                    Text(String(format: "Pointer fingertip confidence: %.0f%%", Double(snapshot?.sample?.joints[snapshot?.pointerAnchor.joint ?? .indexTip]?.confidence ?? 0) * 100))
                         .font(.caption).monospacedDigit()
                 }.padding(4)
             }

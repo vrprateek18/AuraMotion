@@ -4,6 +4,12 @@ import CoreGraphics
 import AVFoundation
 import AppKit
 
+public struct HandPreviewFrame: Sendable {
+    public let trackingID: Int
+    public let sampleTime: Double
+    public let positions: [HandJointName: CGPoint]
+}
+
 public struct HUDSnapshot: Sendable {
     public let state: GestureState
     public let sample: HandSample?
@@ -17,7 +23,14 @@ public struct HUDSnapshot: Sendable {
     public var showHUD = true
     public var clickFeedbackID: UInt64 = 0
     public var clickFeedbackLocation: CGPoint? = nil
+    public var capturePixelFormat: OSType?
     public var rawCursorLocation: CGPoint? = nil
+    public var pointerAnchor: PointerAnchor = .index
+    public var smoothPreview = false
+}
+
+public extension Notification.Name {
+    static let auraHandPreview = Notification.Name("AuraMotionHandPreview")
 }
 
 public protocol AppEnvironmentObserver: AnyObject, Sendable {
@@ -36,7 +49,7 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     // Core subsystems
     public let permissionsManager = PermissionsManager()
     public let settingsRepository = SettingsRepository()
-    public let capturePipeline = CapturePipeline()
+    public let capturePipeline: CapturePipeline
     public let visionWorker = VisionInferenceWorker()
     public let continuityTracker = IdentityContinuityTracker()
     public let cursorController: CursorController
@@ -55,6 +68,7 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     // Confined to interactionQueue
     private var latestSnapshotSample: HandSample?
     private var latestCursorLocation: CGPoint?
+    private var capturePixelFormat: OSType?
     private var latestRawCursorLocation: CGPoint?
     private var isArbitrationCooldownActive = false
     private var isReleaseConfirmed = false
@@ -67,6 +81,47 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     private var clickFeedbackLocation: CGPoint?
     private var hasStarted = false
     private var captureStartRequested = false
+    private var pointerTrack = PresentationTrack(maxLead: 12)
+    private var preview = HandPreview()
+    private var pointerEpoch: UInt64?
+    private var lastMoveTime: Double?
+    private var lastDisplayTick = 0.0
+    private let displayTickSlot = DispatchSemaphore(value: 1)
+
+    private func resetPresentedPointer() {
+        pointerEpoch = nil
+        lastMoveTime = nil
+        pointerTrack = PresentationTrack(maxLead: 12)
+    }
+
+    public func displayTick(at target: Double) {
+        // If interaction is busy, skip this refresh rather than replaying old ticks.
+        guard displayTickSlot.wait(timeout: .now()) == .success else { return }
+        interactionQueue.async {
+            defer { self.displayTickSlot.signal() }
+            guard self.hasStarted, self.currentSettings.smoothPresentation,
+                  target >= CACurrentMediaTime() - 0.018 else { return }
+            self.lastDisplayTick = CACurrentMediaTime()
+            if let epoch = self.pointerEpoch, self.stateMachine.currentState == .pointer,
+               !self.stateMachine.isManualPaused, !self.isArbitrationCooldownActive,
+               self.outputCoordinator.canPost(epoch: epoch),
+               let p = self.pointerTrack.position(at: target) {
+                let bounds = self.currentCalibration.displayBounds
+                let clamped = CGPoint(x: min(max(p.x, bounds.minX), bounds.maxX.nextDown),
+                                      y: min(max(p.y, bounds.minY), bounds.maxY.nextDown))
+                self.outputCoordinator.enqueueMove(to: clamped, epoch: epoch)
+            }
+            if self.currentSettings.showHUD, let sample = self.latestSnapshotSample {
+                let positions = self.preview.positions(at: target)
+                if !positions.isEmpty {
+                    let frame = HandPreviewFrame(trackingID: sample.trackingID, sampleTime: sample.hostTimestamp, positions: positions)
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .auraHandPreview, object: frame)
+                    }
+                }
+            }
+        }
+    }
 
     public func setCalibrationActive(_ active: Bool) {
         interactionQueue.async { [weak self] in
@@ -100,6 +155,7 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
         var cal = calibration
         cal.displayBounds = bounds
 
+        self.capturePipeline = CapturePipeline(pixelLayout: settings.cameraPixelLayout)
         self.currentSettings = settings
         self.currentCalibration = cal
         self.cursorController = CursorController(profile: cal)
@@ -107,6 +163,7 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
         // Wire delegates
         self.capturePipeline.delegate = self
         self.visionWorker.delegate = self
+        self.stateMachine.systemCursorLocation = { CGEvent(source: nil)?.location }
         self.stateMachine.delegate = self
         self.inputArbitrator.delegate = self
 
@@ -120,6 +177,8 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
             return self.permissionsManager.gate.canInject && self.inputArbitrator.isInjectionEnabled()
         }
 
+        self.stateMachine.pointerAnchor = settings.pointerAnchor
+        self.stateMachine.anyFingerClick = settings.anyFingerClick
         self.visionWorker.isMirrored = settings.isCameraMirrored
         self.stateMachine.isClutchEnabled = settings.isClutchEnabled
         self.stateMachine.clutchDwellDuration = settings.clutchDwellTime
@@ -178,24 +237,8 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
             """
             try? diagLines.write(toFile: "/tmp/auramotion_perms.log", atomically: true, encoding: .utf8)
 
-            // Permission request APIs can present system UI. Keep those calls
-            // on the main thread while all gesture/capture state remains on
-            // interactionQueue.
-            if !perms.isAccessibilityTrusted || !perms.isPostEventAuthorized || !perms.isListenEventAuthorized {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    if !perms.isAccessibilityTrusted {
-                        self.permissionsManager.requestAccessibilityIfNeeded()
-                    }
-                    if !perms.isPostEventAuthorized {
-                        self.permissionsManager.requestPostEventAccess()
-                    }
-                    if !perms.isListenEventAuthorized {
-                        self.permissionsManager.requestListenEventAccess()
-                    }
-                }
-            }
-
+            // Request input permissions from the HUD or Settings when the user
+            // chooses a permission. Multiple launch-time TCC sheets hide setup.
             if perms.isCameraAuthorized {
                 self.startCapture(perms)
             } else if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
@@ -283,6 +326,17 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     public func updateSettings(_ newSettings: AppSettings) {
         interactionQueue.async { [weak self] in
             guard let self = self else { return }
+            if self.currentSettings.pointerAnchor != newSettings.pointerAnchor ||
+               self.currentSettings.anyFingerClick != newSettings.anyFingerClick ||
+               self.currentSettings.isCameraMirrored != newSettings.isCameraMirrored {
+                self.outputCoordinator.emergencyRelease()
+                self.stateMachine.reset()
+                self.cursorController.reset()
+                self.latestCursorLocation = nil
+            }
+            self.resetPresentedPointer()
+            self.stateMachine.pointerAnchor = newSettings.pointerAnchor
+            self.stateMachine.anyFingerClick = newSettings.anyFingerClick
             self.currentSettings = newSettings
             self.visionWorker.isMirrored = newSettings.isCameraMirrored
             self.stateMachine.isClutchEnabled = newSettings.isClutchEnabled
@@ -297,6 +351,7 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     public func updateCalibration(_ newCalibration: CalibrationProfile) {
         interactionQueue.async { [weak self] in
             guard let self = self else { return }
+            self.resetPresentedPointer()
             self.currentCalibration = newCalibration
             self.cursorController.updateProfile(newCalibration)
             self.stateMachine.updateCalibration(newCalibration)
@@ -365,16 +420,26 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
                 processedSample = tracked
                 self.landmarkRecorder.record(sample: tracked)
 
-                if let tip = tracked.joint(.indexTip, minConfidence: 0.45) {
+                if tracked.trackingID != self.latestSnapshotSample?.trackingID {
+                    self.resetPresentedPointer()
+                    self.cursorController.reset()
+                }
+                let anchor = self.currentSettings.pointerAnchor
+                if let tip = tracked.joint(anchor.joint, minConfidence: 0.45) {
                     self.latestRawCursorLocation = self.cursorController.mapper.mapToQuartzGlobal(visionPoint: tip)
-                    mappedCursor = self.cursorController.processHand(tracked)
+                    mappedCursor = self.cursorController.processHand(tracked, anchor: anchor)
                 } else {
                     // Keep palm/shortcut detection alive without switching the cursor's
                     // tracking landmark, which caused large jumps on fingertip occlusion.
-                    mappedCursor = self.latestCursorLocation
+                    mappedCursor = anchor == .index ? self.latestCursorLocation : nil
                 }
             }
 
+            self.preview.observe(self.currentSettings.smoothPresentation && self.currentSettings.showHUD ? processedSample : nil,
+                                 received: CACurrentMediaTime())
+            if let format = CMSampleBufferGetFormatDescription(carrier.buffer) {
+                self.capturePixelFormat = CMFormatDescriptionGetMediaSubType(format)
+            }
             self.latestSnapshotSample = processedSample
             self.latestCursorLocation = mappedCursor
 
@@ -388,6 +453,9 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
                 isInjectionAllowed: canInject
             )
 
+            // Some frames (menu navigation, pinch release, transient ambiguity) consume a
+            // gesture without emitting a move or a state transition.
+            if self.lastMoveTime != processedSample?.hostTimestamp { self.resetPresentedPointer() }
             self.publishHUDSnapshot()
         }
     }
@@ -395,11 +463,22 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
     // MARK: - GestureStateMachineDelegate
 
     public func stateMachine(_ fsm: GestureStateMachine, didTransitionTo state: GestureState) {
+        if state != .pointer { resetPresentedPointer() }
         publishHUDSnapshot()
     }
 
     public func stateMachine(_ fsm: GestureStateMachine, emitMoveTo location: CGPoint, epoch: UInt64) {
-        outputCoordinator.enqueueMove(to: location, epoch: epoch)
+        guard CACurrentMediaTime() - lastDisplayTick < 0.06, currentSettings.smoothPresentation,
+              fsm.currentState == .pointer, fsm.canPredictPointer,
+              let sample = latestSnapshotSample, latestRawCursorLocation != nil else {
+            resetPresentedPointer()
+            outputCoordinator.enqueueMove(to: location, epoch: epoch)
+            return
+        }
+        if pointerEpoch != epoch { resetPresentedPointer() }
+        lastMoveTime = sample.hostTimestamp
+        pointerEpoch = epoch
+        pointerTrack.observe(location, timestamp: sample.hostTimestamp, received: CACurrentMediaTime())
     }
 
     public func stateMachine(_ fsm: GestureStateMachine, emitClickAt anchor: CGPoint, epoch: UInt64) {
@@ -554,6 +633,9 @@ public final class AppEnvironment: CapturePipelineDelegate, VisionInferenceWorke
         }
         snapshot.commandMenu = stateMachine.commandMenu.snapshot
         snapshot.showHUD = currentSettings.showHUD
+        snapshot.smoothPreview = currentSettings.smoothPresentation
+        snapshot.capturePixelFormat = capturePipeline.isRunning ? capturePixelFormat : nil
+        snapshot.pointerAnchor = currentSettings.pointerAnchor
         snapshot.rawCursorLocation = latestRawCursorLocation
         snapshot.clickFeedbackID = clickFeedbackID
         snapshot.clickFeedbackLocation = currentSettings.showClickFeedback ? clickFeedbackLocation : nil

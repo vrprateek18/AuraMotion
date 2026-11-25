@@ -5,7 +5,15 @@ public struct HUDView: View {
     @State private var snapshot: HUDSnapshot?
     @State private var isCompact = false
 
-    public init() {}
+    let openSettings: () -> Void
+
+    private var permissions: PermissionsState {
+        snapshot?.permissions ?? AppEnvironment.shared.permissionsManager.gate.cachedSnapshot
+    }
+
+    public init(openSettings: @escaping () -> Void) {
+        self.openSettings = openSettings
+    }
 
     public var body: some View {
         VStack(spacing: 8) {
@@ -20,6 +28,14 @@ public struct HUDView: View {
 
                 Spacer()
 
+                Button(action: openSettings) {
+                    Label("Settings", systemImage: "gearshape")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("AuraMotion Settings")
+                .help("Open AuraMotion settings")
+
                 Button(action: { isCompact.toggle() }) {
                     Image(systemName: isCompact ? "chevron.down" : "chevron.up")
                         .font(.system(size: 9))
@@ -32,17 +48,34 @@ public struct HUDView: View {
 
             // Status Pill
             HStack {
-                Text(snapshot?.feedback ?? snapshot?.state.displayName ?? "INITIALIZING")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(statusColor.opacity(0.25))
-                    .foregroundColor(statusColor)
-                    .cornerRadius(6)
+                if permissions.statusLabel != nil {
+                    VStack(alignment: .leading, spacing: 3) {
+                        if let reason = permissions.inputBlockingReason {
+                            permissionButton(reason) {
+                                let manager = AppEnvironment.shared.permissionsManager
+                                if permissions.isAccessibilityTrusted { manager.requestPostEventAccess() }
+                                manager.openSystemSettingsAccessibility()
+                            }
+                        }
+                        if !permissions.isCameraAuthorized {
+                            permissionButton("Camera access is required") {
+                                AppEnvironment.shared.permissionsManager.openSystemSettingsCamera()
+                            }
+                        }
+                    }
+                } else {
+                    Text(snapshot?.feedback ?? snapshot?.state.displayName ?? "INITIALIZING")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(statusColor.opacity(0.25))
+                        .foregroundColor(statusColor)
+                        .cornerRadius(6)
+                }
 
                 Spacer()
 
-                if let p95 = snapshot?.performance.inferenceDurationP95Ms {
+                if permissions.statusLabel == nil, let p95 = snapshot?.performance.inferenceDurationP95Ms {
                     Text(String(format: "%.1f ms", p95))
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundColor(.white.opacity(0.7))
@@ -50,7 +83,7 @@ public struct HUDView: View {
             }
             .padding(.horizontal, 10)
 
-            if !isCompact {
+            if !isCompact && permissions.isCameraAuthorized {
                 // Live Hand Skeleton Canvas
                 ZStack {
                     RoundedRectangle(cornerRadius: 8)
@@ -58,7 +91,7 @@ public struct HUDView: View {
                         .frame(height: 140)
 
                     if let sample = snapshot?.sample {
-                        SkeletonView(sample: sample)
+                        SkeletonView(sample: sample, anchor: snapshot?.pointerAnchor ?? .index, smooth: snapshot?.smoothPreview ?? false)
                             .frame(height: 130)
                     } else {
                         VStack(spacing: 4) {
@@ -105,6 +138,24 @@ public struct HUDView: View {
         }
     }
 
+    private func permissionButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(label)
+                Image(systemName: "arrow.up.right").accessibilityHidden(true)
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(.red.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+            .foregroundStyle(.red)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityHint("Opens the matching permission in System Settings")
+    }
+
     private var statusColor: Color {
         guard let state = snapshot?.state else { return .gray }
         switch state {
@@ -141,6 +192,16 @@ struct MetricLabel: View {
 
 struct SkeletonView: View {
     let sample: HandSample
+    let anchor: PointerAnchor
+    let smooth: Bool
+    @State private var frame: HandPreviewFrame?
+
+    private func position(_ name: HandJointName) -> CGPoint? {
+        if smooth, let frame, frame.trackingID == sample.trackingID, frame.sampleTime >= sample.hostTimestamp {
+            return frame.positions[name]
+        }
+        return sample.joint(name, minConfidence: 0.25)
+    }
 
     // Bone connections
     private let bones: [(HandJointName, HandJointName)] = [
@@ -156,8 +217,8 @@ struct SkeletonView: View {
         GeometryReader { geo in
             Path { path in
                 for (fromName, toName) in bones {
-                    if let fromPt = sample.joint(fromName, minConfidence: 0.2),
-                       let toPt = sample.joint(toName, minConfidence: 0.2) {
+                    if let fromPt = position(fromName),
+                       let toPt = position(toName) {
                         let p1 = convert(fromPt, size: geo.size)
                         let p2 = convert(toPt, size: geo.size)
                         path.move(to: p1)
@@ -176,13 +237,16 @@ struct SkeletonView: View {
 
             // Landmarks
             ForEach(HandJointName.allCases, id: \.self) { name in
-                if let pt = sample.joint(name, minConfidence: 0.25) {
+                if let pt = position(name) {
                     Circle()
                         .fill(name == .indexTip || name == .thumbTip ? Color.yellow : Color.cyan)
-                        .frame(width: name == .indexTip ? 6 : 4, height: name == .indexTip ? 6 : 4)
+                        .frame(width: name == anchor.joint ? 7 : 4, height: name == anchor.joint ? 7 : 4)
                         .position(convert(pt, size: geo.size))
                 }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .auraHandPreview)) { note in
+            frame = note.object as? HandPreviewFrame
         }
     }
 

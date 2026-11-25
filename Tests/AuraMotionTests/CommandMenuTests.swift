@@ -3,26 +3,39 @@ import CoreGraphics
 @testable import AuraMotionCore
 
 final class CommandMenuTests: XCTestCase {
-    func testBoundaryTremorDoesNotChangeSelectedTile() {
+    // Deliberately use screen points on a secondary display, including a gap.
+    private let frames: [GestureCommand: CGRect] = [
+        .rightClick: CGRect(x: -700, y: 200, width: 150, height: 72),
+        .doubleClick: CGRect(x: -540, y: 200, width: 150, height: 72)
+    ]
+
+    private func aim(_ menu: GestureCommandMenu, at point: CGPoint, distance: CGFloat = 0.7,
+                     time: Double = 11.1, finger: HandJointName = .indexTip) -> GestureCommand? {
+        menu.navigate(cursor: point, isPointing: distance >= 0.38, finger: finger, pinchDistance: distance,
+                      contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: time)
+    }
+
+    func testOnlyActualOnscreenTilesCanBeSelected() throws {
         let menu = GestureCommandMenu()
         open(menu)
-        _ = menu.navigate(index: CGPoint(x: 0.5, y: 0.5), isPointing: true, pinchDistance: 0.7, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.1)
-        XCTAssertEqual(menu.snapshot?.selected, .nextApp)
-        for frame in 0..<30 {
-            let x = frame.isMultiple(of: 2) ? 0.539 : 0.541
-            _ = menu.navigate(index: CGPoint(x: x, y: 0.5), isPointing: true, pinchDistance: 0.7, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.2 + Double(frame) / 30)
-            XCTAssertEqual(menu.snapshot?.selected, .nextApp)
-        }
-        for frame in 0..<10 {
-            _ = menu.navigate(index: CGPoint(x: 0.58, y: 0.5), isPointing: true, pinchDistance: 0.7, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 12.3 + Double(frame) / 30)
-        }
-        XCTAssertEqual(menu.snapshot?.selected, .minimize)
+        _ = aim(menu, at: CGPoint(x: 0.5, y: 0.5))
+        XCTAssertNil(menu.snapshot?.selected)
+        _ = aim(menu, at: CGPoint(x: -500, y: 220))
+        XCTAssertEqual(menu.snapshot?.selected, .doubleClick)
+        _ = aim(menu, at: CGPoint(x: -546, y: 220))
+        XCTAssertNil(menu.snapshot?.selected)
+        XCTAssertNil(aim(menu, at: CGPoint(x: -546, y: 220), distance: 0.10, time: 11.4))
+        XCTAssertNil(aim(menu, at: CGPoint(x: -546, y: 220), distance: 0.10, time: 11.5))
+        XCTAssertTrue(menu.isOpen)
     }
 
     private func open(_ menu: GestureCommandMenu, target: CGPoint = CGPoint(x: 700, y: 400)) {
         for frame in 0...30 {
             menu.observePalm(position: CGPoint(x: 0.5, y: 0.5), timestamp: 10 + Double(frame) / 30, target: target)
-            if menu.isOpen { break }
+            if let view = menu.snapshot {
+                menu.setTileFrames(frames, for: view.id)
+                break
+            }
         }
     }
 
@@ -33,7 +46,7 @@ final class CommandMenuTests: XCTestCase {
         }
         open(menu)
         XCTAssertTrue(menu.isOpen)
-        XCTAssertTrue(menu.snapshot?.awaitingPointer == true)
+        XCTAssertNil(menu.snapshot?.selected)
     }
 
     func testPointThenPinchSelectsOnceAndPreservesOriginalTarget() throws {
@@ -41,12 +54,12 @@ final class CommandMenuTests: XCTestCase {
         let target = CGPoint(x: 700, y: 400)
         open(menu, target: target)
         XCTAssertEqual(menu.snapshot?.target, target)
-        // First pointer frame establishes the center. Move up-left to Right click.
-        XCTAssertNil(menu.navigate(index: CGPoint(x: 0.5, y: 0.5), isPointing: true, pinchDistance: 0.7, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.1))
-        XCTAssertNil(menu.navigate(index: CGPoint(x: 0.42, y: 0.58), isPointing: true, pinchDistance: 0.7, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.2))
+        let tile = CGPoint(x: -619, y: 238)
+        XCTAssertNil(aim(menu, at: tile))
         XCTAssertEqual(menu.snapshot?.selected, .rightClick)
-        XCTAssertNil(menu.navigate(index: CGPoint(x: 0.44, y: 0.56), isPointing: false, pinchDistance: 0.15, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.3))
-        XCTAssertEqual(menu.navigate(index: CGPoint(x: 0.46, y: 0.54), isPointing: false, pinchDistance: 0.15, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.4), .rightClick)
+        XCTAssertNil(aim(menu, at: tile, distance: 0.15, time: 11.3, finger: .ringTip))
+        XCTAssertEqual(aim(menu, at: tile, distance: 0.15, time: 11.4, finger: .ringTip), .rightClick)
+        XCTAssertEqual(menu.closingFinger, .ringTip)
         XCTAssertFalse(menu.isOpen)
         XCTAssertTrue(menu.consumeClosingContact(distance: 0.1, releaseThreshold: 0.38))
         XCTAssertTrue(menu.consumeClosingContact(distance: 0.6, releaseThreshold: 0.38))
@@ -57,18 +70,15 @@ final class CommandMenuTests: XCTestCase {
         let menu = GestureCommandMenu()
         open(menu)
         menu.cancel()
-        XCTAssertNil(menu.navigate(index: .zero, isPointing: true, pinchDistance: 0.1, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 11.1))
+        XCTAssertNil(aim(menu, at: .zero, distance: 0.1))
         open(menu)
-        XCTAssertNil(menu.navigate(index: .zero, isPointing: true, pinchDistance: 0.1, contactThreshold: 0.28, releaseThreshold: 0.38, timestamp: 30))
+        let oldID = menu.snapshot!.id
+        XCTAssertNil(aim(menu, at: .zero, distance: 0.1, time: 30))
         XCTAssertFalse(menu.isOpen)
-    }
-
-    func testNineMenuCellsMatchDisplayedOrder() {
-        for (index, command) in GestureCommand.allCases.enumerated() {
-            let point = CGPoint(x: (Double(index % 3) + 0.5) / 3, y: (Double(index / 3) + 0.5) / 3)
-            XCTAssertEqual(GestureCommandMenu.command(at: point), command)
-        }
-        XCTAssertNil(GestureCommandMenu.command(at: CGPoint(x: -0.1, y: 0)))
+        open(menu)
+        menu.setTileFrames([:], for: oldID)
+        _ = aim(menu, at: CGPoint(x: -690, y: 201))
+        XCTAssertEqual(menu.snapshot?.selected, .rightClick)
     }
 
     func testNewClickCommandsUseCapturedTargetAndDoNotMoveCursor() {

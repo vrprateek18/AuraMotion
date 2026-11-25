@@ -162,6 +162,8 @@ public final class PermissionsManager: @unchecked Sendable {
     }
 
     public func openSystemSettingsAccessibility() {
+        // Register this exact running copy with macOS before opening its privacy pane.
+        if !AXIsProcessTrusted() { requestAccessibilityIfNeeded() }
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }

@@ -31,100 +31,98 @@ public enum GestureCommand: String, CaseIterable, Sendable {
     }
 }
 
-public struct CommandMenuSnapshot: Sendable {
+public struct CommandMenuSnapshot: Sendable, Equatable {
+    public let id: UInt64
     public let selected: GestureCommand?
-    /// Local normalized position, with top-left origin.
-    public let pointer: CGPoint
     public let target: CGPoint
-    public let awaitingPointer: Bool
 }
 
-/// Pure interaction model: no OS events are sent while navigating the menu.
+/// The palette consumes a pinch over a visible tile. Cursor movement belongs to
+/// the ordinary pointer pipeline, including while the palette is visible.
 public final class GestureCommandMenu: @unchecked Sendable {
     public var holdDuration: TimeInterval = 0.9
     public private(set) var isOpen = false
+    public private(set) var contactFinger: HandJointName?
+    public private(set) var closingFinger: HandJointName?
     private var holdStart: Double?
     private var palmAnchor: CGPoint?
-    private var pointerOrigin: CGPoint?
-    private var pointer = CGPoint(x: 0.5, y: 0.5)
     private var target: CGPoint = .zero
     private var selected: GestureCommand?
-    private var lockedSelection: GestureCommand?
+    private var frames: [GestureCommand: CGRect] = [:]
     private var confirmation = ContactConfirmation(duration: 0.08)
     private var lastTime: Double?
-    private var suppressUntilRelease = false
-    private var openedAt: Double = 0
-    private let pointerFilter = OneEuroFilter2D(minCutoff: 3, beta: 4)
+    private var openedAt = 0.0
+    private var id: UInt64 = 0
 
     public init() {}
     public var snapshot: CommandMenuSnapshot? {
-        isOpen ? CommandMenuSnapshot(selected: lockedSelection ?? selected, pointer: pointer, target: target, awaitingPointer: pointerOrigin == nil) : nil
+        isOpen ? CommandMenuSnapshot(id: id, selected: selected, target: target) : nil
     }
     public func cancel() {
-        isOpen = false; holdStart = nil; palmAnchor = nil; pointerOrigin = nil
-        selected = nil; lockedSelection = nil; confirmation.reset()
-        pointerFilter.reset()
+        isOpen = false
+        resetHold()
+        frames.removeAll()
+        selected = nil
+        contactFinger = nil
+        closingFinger = nil
+        confirmation.reset()
     }
     public func resetHold() { holdStart = nil; palmAnchor = nil }
 
     @discardableResult
-    public func observePalm(position: CGPoint?, timestamp: Double, target: CGPoint) -> Bool {
+    public func observePalm(position: CGPoint?, timestamp: Double, target: @autoclosure () -> CGPoint) -> Bool {
         guard let position else { resetHold(); return false }
         if let previous = lastTime, timestamp - previous > 0.15 { resetHold() }
         lastTime = timestamp
         if let anchor = palmAnchor, hypot(position.x - anchor.x, position.y - anchor.y) > 0.035 { resetHold() }
         if holdStart == nil { holdStart = timestamp; palmAnchor = position }
         guard timestamp - (holdStart ?? timestamp) >= holdDuration else { return false }
-        isOpen = true; self.target = target; pointerOrigin = nil
-        pointer = CGPoint(x: 0.5, y: 0.5); selected = nil
-        openedAt = timestamp; resetHold()
+        isOpen = true
+        id &+= 1
+        self.target = target()
+        openedAt = timestamp
+        resetHold()
         return true
     }
 
-    /// Returns true while closing pinch is still held, so it cannot become a click.
+    /// Quartz screen coordinates of the tiles actually laid out by SwiftUI.
+    public func setTileFrames(_ frames: [GestureCommand: CGRect], for id: UInt64) {
+        guard isOpen, self.id == id else { return }
+        self.frames = frames
+    }
+
     public func consumeClosingContact(distance: CGFloat?, releaseThreshold: CGFloat) -> Bool {
-        guard suppressUntilRelease else { return false }
-        if let distance, distance >= releaseThreshold { suppressUntilRelease = false }
+        guard closingFinger != nil else { return false }
+        if let distance, distance >= releaseThreshold { closingFinger = nil }
         return true
     }
 
-    public func navigate(index: CGPoint?, isPointing: Bool, pinchDistance: CGFloat?, contactThreshold: CGFloat, releaseThreshold: CGFloat, timestamp: Double) -> GestureCommand? {
+    public func navigate(cursor: CGPoint, isPointing: Bool, finger: HandJointName, pinchDistance: CGFloat?,
+                         contactThreshold: CGFloat, releaseThreshold: CGFloat, timestamp: Double) -> GestureCommand? {
         guard isOpen else { return nil }
-        if timestamp - openedAt > 12 { cancel(); return nil }
-        guard let index, let distance = pinchDistance else { confirmation.reset(); lockedSelection = nil; return nil }
-        if pointerOrigin == nil {
-            guard isPointing, distance >= releaseThreshold else { return nil }
-            pointerOrigin = index
+        guard timestamp - openedAt <= 12 else { cancel(); return nil }
+        let hovered = frames.first { $0.value.contains(cursor) }?.key
+        guard let distance = pinchDistance else {
+            selected = nil
+            confirmation.reset()
+            contactFinger = nil
+            return nil
         }
         if distance >= releaseThreshold {
-            confirmation.reset(); lockedSelection = nil
-            let origin = pointerOrigin ?? index
-            // A 24%-of-frame hand sweep covers the entire palette.
-            guard isPointing else { return nil }
-            let rawPointer = CGPoint(x: min(1, max(0, 0.5 + (index.x - origin.x) / 0.24)),
-                              y: min(1, max(0, 0.5 - (index.y - origin.y) / 0.24)))
-            pointer = pointerFilter.filter(point: rawPointer, timestamp: timestamp)
-            // Keep the selected tile until the pointer clears its edge by 3%.
-            if let selected, let cell = GestureCommand.allCases.firstIndex(of: selected) {
-                let bounds = CGRect(x: CGFloat(cell % 3) / 3, y: CGFloat(cell / 3) / 3, width: 1.0 / 3, height: 1.0 / 3).insetBy(dx: -0.03, dy: -0.03)
-                if bounds.contains(pointer) { return nil }
-            }
-            selected = Self.command(at: pointer)
-        } else if distance <= contactThreshold {
-            if lockedSelection == nil { lockedSelection = selected }
-            if confirmation.update(matches: lockedSelection != nil, timestamp: timestamp), let command = lockedSelection {
-                suppressUntilRelease = true
+            contactFinger = nil
+            confirmation.reset()
+            selected = isPointing ? hovered : nil
+        } else if distance <= contactThreshold, let selected, hovered == selected {
+            if finger != contactFinger { confirmation.reset(); contactFinger = finger }
+            if confirmation.update(matches: true, timestamp: timestamp) {
                 cancel()
-                return command
+                closingFinger = finger
+                return selected
             }
         } else {
             confirmation.reset()
+            if hovered != selected { selected = nil }
         }
         return nil
-    }
-
-    public static func command(at point: CGPoint) -> GestureCommand? {
-        guard point.x >= 0, point.x <= 1, point.y >= 0, point.y <= 1 else { return nil }
-        return GestureCommand.allCases[min(2, Int(point.y * 3)) * 3 + min(2, Int(point.x * 3))]
     }
 }

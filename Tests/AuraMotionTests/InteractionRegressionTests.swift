@@ -22,7 +22,7 @@ final class InteractionRegressionTests: XCTestCase {
         XCTAssertEqual(fsm.currentState, .pointer)
     }
 
-    func testMenuConsumesGestureInputAndTrackingLossDismissesIt() {
+    func testMenuUsesNormalMappedPointerAndTrackingLossDismissesIt() {
         let fsm = GestureStateMachine()
         let output = MockStateMachineDelegate()
         fsm.delegate = output
@@ -33,7 +33,8 @@ final class InteractionRegressionTests: XCTestCase {
         }
         XCTAssertTrue(fsm.commandMenu.isOpen)
         fsm.processFrame(sample: sample(middleExtended: false, time: 11.1), mappedCursorLocation: CGPoint(x: 800, y: 700), currentEpoch: 1, isInjectionAllowed: true)
-        XCTAssertTrue(output.moves.isEmpty)
+        XCTAssertEqual(output.moves, [CGPoint(x: 800, y: 700)])
+        XCTAssertTrue(fsm.canPredictPointer)
         XCTAssertTrue(output.scrolls.isEmpty)
         XCTAssertTrue(output.clickAnchors.isEmpty)
         fsm.processFrame(sample: nil, mappedCursorLocation: nil, currentEpoch: 1, isInjectionAllowed: true)
@@ -54,6 +55,48 @@ final class InteractionRegressionTests: XCTestCase {
             estimatedHandedness: .right, trackingID: 1)
         fsm.processFrame(sample: foldedSample, mappedCursorLocation: CGPoint(x: 800, y: 700), currentEpoch: 1, isInjectionAllowed: true)
         XCTAssertFalse(fsm.commandMenu.isOpen)
+    }
+
+    func testThumbMenuUsesVisibleCursorForHitTestAndConsumesMiddlePinch() throws {
+        let fsm = GestureStateMachine()
+        let output = MockStateMachineDelegate()
+        fsm.delegate = output
+        fsm.isClutchEnabled = false
+        fsm.anyFingerClick = true
+        fsm.pointerAnchor = .thumb
+        fsm.confidenceGate.reacquisitionDwellSeconds = 0
+        let visible = CGPoint(x: 810, y: 420)
+        let measured = CGPoint(x: 800, y: 420)
+        fsm.systemCursorLocation = { visible }
+        fsm.commandMenu.holdDuration = 0
+        let target = CGPoint(x: 100, y: 200)
+        XCTAssertTrue(fsm.commandMenu.observePalm(position: .zero, timestamp: 10, target: target))
+        let menu = try XCTUnwrap(fsm.commandMenu.snapshot)
+        fsm.commandMenu.setTileFrames([.missionControl: CGRect(x: 805, y: 400, width: 90, height: 64)], for: menu.id)
+        for i in 0..<14 {
+            let time = 10.1 + Double(i) / 30
+            let base = sample(middleExtended: false, time: time)
+            var joints = base.joints
+            let thumb = try XCTUnwrap(base.joint(.thumbTip))
+            joints[.thumbMP] = HandJoint(name: .thumbMP, position: CGPoint(x: 0.38, y: 0.4), confidence: 1)
+            joints[.indexTip] = HandJoint(name: .indexTip, position: CGPoint(x: 0.44, y: 0.42), confidence: 1)
+            if i >= 3 && i < 12 {
+                joints[.middleTip] = HandJoint(name: .middleTip, position: thumb, confidence: 1)
+            }
+            let hand = HandSample(hostTimestamp: time, presentationTimeSeconds: time, isPresentationTimeEstimated: false,
+                                  joints: joints, overallConfidence: 1, estimatedHandedness: .right, trackingID: 1)
+            fsm.processFrame(sample: hand, mappedCursorLocation: measured, currentEpoch: 1, isInjectionAllowed: true)
+            if i == 1 {
+                XCTAssertEqual(output.moves.last, measured)
+                XCTAssertTrue(fsm.canPredictPointer)
+                XCTAssertEqual(fsm.commandMenu.snapshot?.selected, .missionControl)
+            }
+        }
+        XCTAssertEqual(output.commands, [.missionControl])
+        XCTAssertFalse(fsm.commandMenu.isOpen)
+        XCTAssertTrue(output.clickAnchors.isEmpty)
+        XCTAssertTrue(output.dragStarts.isEmpty)
+        XCTAssertTrue(output.moves.allSatisfy { $0 == measured })
     }
 
     private func sample(middleExtended: Bool = true, thumb: CGPoint = CGPoint(x: 0.25, y: 0.55), time: Double = 10) -> HandSample {

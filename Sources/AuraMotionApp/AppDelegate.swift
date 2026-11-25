@@ -8,6 +8,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, AppEnvironmentO
     private var hudWindow: FloatingHUDWindow?
     private let commandMenuWindow = CommandMenuWindowController()
     private let clickFeedback = ClickFeedbackWindowController()
+    private var displayLink: CADisplayLink?
     private var lastFeedbackID: UInt64 = 0
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -15,12 +16,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, AppEnvironmentO
         let screenRect = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let hudRect = NSRect(x: screenRect.maxX - 240, y: screenRect.maxY - 220, width: 220, height: 200)
         let hud = FloatingHUDWindow(contentRect: hudRect)
-        hud.contentView = NSHostingView(rootView: HUDView())
+        let controls = StatusItemController(hudWindow: hud)
+        self.statusItemController = controls
+        hud.contentView = NSHostingView(rootView: HUDView(openSettings: controls.openSettings))
         if AppEnvironment.shared.currentSettings.showHUD { hud.orderFrontRegardless() }
         self.hudWindow = hud
-
-        // 2. Create Status Item
-        self.statusItemController = StatusItemController(hudWindow: hud)
 
         // 3. Register environment observer
         let env = AppEnvironment.shared
@@ -41,10 +41,29 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, AppEnvironmentO
         )
 
         // 5. Start environment
+        if let screen = NSScreen.screens.first {
+            let link = screen.displayLink(target: self, selector: #selector(presentFrame(_:)))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
         env.start()
+        if env.permissionsManager.gate.cachedSnapshot.statusLabel != nil {
+            controls.openSettings()
+        }
+    }
+
+    public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        statusItemController?.openSettings()
+        return false
+    }
+
+    @objc private func presentFrame(_ link: CADisplayLink) {
+        AppEnvironment.shared.displayTick(at: link.targetTimestamp)
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        displayLink?.invalidate()
         AppEnvironment.shared.stop()
     }
 
