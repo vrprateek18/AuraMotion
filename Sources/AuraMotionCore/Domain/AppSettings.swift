@@ -14,8 +14,27 @@ public enum SwipeActionType: String, Sendable, Codable, CaseIterable {
     }
 }
 
+public enum PointerAnchor: String, Sendable, Codable, CaseIterable {
+    case thumb, index
+    public var joint: HandJointName { self == .thumb ? .thumbTip : .indexTip }
+
+    /// The thumb can aim with the index relaxed. A closed fist still disengages.
+    func isThumbPointing(_ sample: HandSample) -> Bool {
+        guard self == .thumb, let scale = sample.scaleReference,
+              let tip = sample.joint(.thumbTip, minConfidence: 0.45),
+              let knuckle = sample.joint(.indexMCP, minConfidence: 0.45),
+              let base = sample.joint(.thumbMP, minConfidence: 0.45) else { return false }
+        return hypot(tip.x - knuckle.x, tip.y - knuckle.y) > scale * 0.65 &&
+               hypot(tip.x - base.x, tip.y - base.y) > scale * 0.35
+    }
+}
+
 /// User preferences with safety defaults.
 public struct AppSettings: Sendable, Codable, Equatable {
+    public var pointerAnchor: PointerAnchor = .thumb
+    public var anyFingerClick = true
+    public var smoothPresentation = true
+    public var cameraPixelLayout: CameraPixelLayout = .bgra
     public var isCameraMirrored: Bool
     public var isClutchEnabled: Bool
     public var clutchDwellTime: TimeInterval

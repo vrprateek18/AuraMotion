@@ -13,7 +13,7 @@ struct MovementCalibrationView: View {
                 .font(.callout).foregroundStyle(.secondary)
             if !started {
                 Button("Start movement setup") {
-                    session = MovementCalibration(); notice = ""; started = true
+                    session = MovementCalibration(anchor: AppEnvironment.shared.currentSettings.pointerAnchor); notice = ""; started = true
                     AppEnvironment.shared.setCalibrationActive(true)
                 }
             } else if !session.isComplete {

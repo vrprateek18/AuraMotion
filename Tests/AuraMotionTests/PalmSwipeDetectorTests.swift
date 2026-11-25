@@ -14,6 +14,7 @@ final class PalmSwipeDetectorTests: XCTestCase {
                              mappedCursorLocation: CGPoint(x: 400, y: 400), currentEpoch: 1, isInjectionAllowed: true)
         }
         XCTAssertTrue(fsm.commandMenu.isOpen)
+        XCTAssertTrue(output.moves.isEmpty)
         XCTAssertTrue(output.swipes.isEmpty)
         XCTAssertTrue(output.clickAnchors.isEmpty)
         fsm.isManualPaused = true

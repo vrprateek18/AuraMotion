@@ -8,7 +8,7 @@ public struct MovementCalibration {
         case still, slow, fast
         public var instruction: String {
             switch self {
-            case .still: return "Point with your index finger and hold comfortably still."
+            case .still: return "Aim the pointer and hold your hand comfortably still."
             case .slow: return "Keep pointing and sweep your hand slowly from side to side."
             case .fast: return "Keep pointing and make quicker, comfortable side-to-side sweeps."
             }
@@ -23,18 +23,19 @@ public struct MovementCalibration {
     private var recordings: [Int: [CGPoint]] = [:]
     private var speeds: [Int: Double] = [:]
     private var trackingID: Int?
-    public init() {}
+    private let anchor: PointerAnchor
+    public init(anchor: PointerAnchor = .index) { self.anchor = anchor }
 
     @discardableResult
     public mutating func add(_ sample: HandSample) -> Bool {
         guard !isComplete else { return false }
         guard sample.overallConfidence >= 0.6,
-              let tip = sample.joint(.indexTip, minConfidence: 0.6),
+              let tip = sample.joint(anchor.joint, minConfidence: 0.6),
               tip.x.isFinite, tip.y.isFinite, sample.hostTimestamp.isFinite else { return false }
         let pose = PoseClassifier.classify(sample: sample)
-        guard pose.isIndexExtended, !pose.isMiddleExtended, !pose.isPinchApproach else {
+        guard (pose.isIndexExtended || anchor.isThumbPointing(sample)), !pose.isMiddleExtended, !pose.isPinchApproach else {
             points = []; times = []; count = 0
-            message = "Keep only the index finger extended, with thumb comfortably apart."
+            message = "Keep the pointing pose with your fingertips comfortably apart."
             return false
         }
         if let last = times.last {

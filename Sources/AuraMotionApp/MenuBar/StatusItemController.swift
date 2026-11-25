@@ -86,18 +86,23 @@ public final class StatusItemController: NSObject {
         diagnosticsWindow?.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func openSettings() {
+    @objc func openSettings() {
         if settingsWindow == nil {
             let win = NSWindow(
-                contentRect: NSRect(x: 150, y: 150, width: 440, height: 460),
-                styleMask: [.titled, .closable],
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 560),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
                 backing: .buffered,
                 defer: false
             )
+            win.isReleasedWhenClosed = false
             win.title = "AuraMotion Settings"
+            win.collectionBehavior.insert(.moveToActiveSpace)
             win.contentView = NSHostingView(rootView: SettingsView())
+            win.center()
             settingsWindow = win
         }
+        if settingsWindow?.isMiniaturized == true { settingsWindow?.deminiaturize(nil) }
+        NSApp.activate()
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 

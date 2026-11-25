@@ -10,6 +10,19 @@ public protocol CapturePipelineDelegate: AnyObject, Sendable {
     func capturePipelineInterruptionEnded(_ pipeline: CapturePipeline)
 }
 
+public enum CameraPixelLayout: String, Codable, Sendable {
+    case bgra, nativeYUV
+
+    func outputFormat(available: [OSType], native: OSType) -> OSType? {
+        let nv12 = [kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+        if self == .nativeYUV {
+            if nv12.contains(native), available.contains(native) { return native }
+            if let supported = nv12.first(where: available.contains) { return supported }
+        }
+        return available.contains(kCVPixelFormatType_32BGRA) ? kCVPixelFormatType_32BGRA : nil
+    }
+}
+
 public enum CaptureLifecycleState: String, Sendable {
     case idle
     case configuring
@@ -33,7 +46,9 @@ public final class CapturePipeline: NSObject, AVCaptureVideoDataOutputSampleBuff
     private var snapshotState: CaptureLifecycleState = .idle
     private let stateLock = NSLock()
 
-    public override init() {
+    private let pixelLayout: CameraPixelLayout
+    public init(pixelLayout: CameraPixelLayout = .bgra) {
+        self.pixelLayout = pixelLayout
         super.init()
         setupNotifications()
     }
@@ -209,9 +224,6 @@ public final class CapturePipeline: NSObject, AVCaptureVideoDataOutputSampleBuff
         let output = AVCaptureVideoDataOutput()
         // MANDATORY: drop stale video frames immediately
         output.alwaysDiscardsLateVideoFrames = true
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
-        ]
         output.setSampleBufferDelegate(self, queue: captureQueue)
 
         if captureSession.canAddOutput(output) {
@@ -227,6 +239,12 @@ public final class CapturePipeline: NSObject, AVCaptureVideoDataOutputSampleBuff
         selection.device.activeVideoMinFrameDuration = frameDuration
         selection.device.activeVideoMaxFrameDuration = frameDuration
         selection.device.unlockForConfiguration()
+
+        // The advertised output formats depend on the connected, active input.
+        let native = CMFormatDescriptionGetMediaSubType(selection.format.formatDescription)
+        if let type = pixelLayout.outputFormat(available: output.availableVideoPixelFormatTypes, native: native) {
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(type)]
+        }
     }
 
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate

@@ -37,10 +37,11 @@ public final class CursorController: @unchecked Sendable {
         filter.beta = min(0.025, max(0.004, profile.cursorMotionBeta ?? 0.008))
     }
 
-    public func processHand(_ sample: HandSample) -> CGPoint? {
+    public func processHand(_ sample: HandSample, anchor: PointerAnchor = .index) -> CGPoint? {
         // Reset before fusion, so a long capture gap cannot discard a fresh anchor.
         if let time = lastTimestamp, sample.hostTimestamp - time > 0.25 { reset() }
-        return processIndexTip(normalizedPoint: handFusion.update(sample), timestamp: sample.hostTimestamp)
+        let position = anchor == .thumb ? sample.joint(.thumbTip, minConfidence: 0.45) : handFusion.update(sample)
+        return processIndexTip(normalizedPoint: position, timestamp: sample.hostTimestamp)
     }
 
     /// Maps normalized index-finger tip and applies 1€ adaptive filtering.

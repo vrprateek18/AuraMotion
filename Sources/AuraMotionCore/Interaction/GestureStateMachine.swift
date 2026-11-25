@@ -42,10 +42,45 @@ public final class GestureStateMachine: @unchecked Sendable {
     public let scrollDetector = ScrollDetector()
     public let palmSwipeDetector = PalmSwipeDetector()
     public let commandMenu = GestureCommandMenu()
+    var systemCursorLocation: (() -> CGPoint?)?
     private var lastPointerTarget: CGPoint?
     private var scrollPoseConfirmation = ContactConfirmation(duration: 0.04)
     private var scrollPoseConfirmed = false
     private var lastScrollPoseTime: TimeInterval?
+
+    public var pointerAnchor: PointerAnchor = .index
+    public var anyFingerClick = false
+    public private(set) var canPredictPointer = false
+    private var contactFinger: HandJointName?
+    private var separatedFingers: Set<HandJointName> = []
+
+    // Keep the same finger through a contact. Occlusion cancels contact instead of
+    // turning the distance to another fingertip into an apparent release.
+    private func thumbDistance(_ sample: HandSample, to finger: HandJointName) -> CGFloat? {
+        guard let thumb = sample.joint(.thumbTip, minConfidence: 0.45),
+              let tip = sample.joint(finger, minConfidence: 0.45),
+              let scale = sample.scaleReference else { return nil }
+        return hypot(tip.x - thumb.x, tip.y - thumb.y) / scale
+    }
+
+    private func clickDistance(_ sample: HandSample, indexDistance: CGFloat?) -> CGFloat? {
+        guard anyFingerClick else { return indexDistance }
+        if let finger = commandMenu.contactFinger { return thumbDistance(sample, to: finger) }
+        if pinchDetector.isContactActive, let finger = contactFinger {
+            separatedFingers.remove(finger)
+            return thumbDistance(sample, to: finger)
+        }
+        let nearest = [HandJointName.indexTip, .middleTip, .ringTip, .littleTip].compactMap { name -> (HandJointName, CGFloat)? in
+            guard let d = thumbDistance(sample, to: name) else {
+                separatedFingers.remove(name)
+                return nil
+            }
+            if d >= pinchDetector.releaseThreshold { separatedFingers.insert(name) }
+            return separatedFingers.contains(name) ? (name, d) : nil
+        }.min { $0.1 < $1.1 }
+        contactFinger = nearest?.0
+        return nearest?.1
+    }
 
     public var isClutchEnabled: Bool = true
     public var clutchDwellDuration: TimeInterval {
@@ -75,6 +110,9 @@ public final class GestureStateMachine: @unchecked Sendable {
         scrollPoseConfirmed = false
         lastScrollPoseTime = nil
         currentState = .idle
+        contactFinger = nil
+        separatedFingers.removeAll()
+        lastPointerTarget = nil
         commandMenu.cancel()
         confidenceGate.reset()
         clutch.reset()
@@ -91,7 +129,11 @@ public final class GestureStateMachine: @unchecked Sendable {
             scrollPoseConfirmed = false
             lastScrollPoseTime = nil
         }
-        if newState == .paused || newState == .trackingLost { commandMenu.cancel() }
+        if newState == .paused || newState == .trackingLost {
+            commandMenu.cancel()
+            contactFinger = nil
+            separatedFingers.removeAll()
+        }
         guard currentState != newState else { return }
         currentState = newState
         delegate?.stateMachine(self, didTransitionTo: newState)
@@ -104,6 +146,7 @@ public final class GestureStateMachine: @unchecked Sendable {
         currentEpoch: UInt64,
         isInjectionAllowed: Bool
     ) {
+        canPredictPointer = false
         let timestamp = sample?.hostTimestamp ?? CACurrentMediaTime()
 
         // ── 1. Manual Pause ──
@@ -149,24 +192,30 @@ public final class GestureStateMachine: @unchecked Sendable {
         }
         let features = PoseClassifier.classify(sample: sample, pinchReleaseThreshold: pinchDetector.releaseThreshold)
 
-        if commandMenu.consumeClosingContact(distance: features.normalizedPinchDistance, releaseThreshold: pinchDetector.releaseThreshold) { return }
+        if let closing = commandMenu.closingFinger,
+           commandMenu.consumeClosingContact(distance: thumbDistance(sample, to: closing), releaseThreshold: pinchDetector.releaseThreshold) { return }
+        let distance = clickDistance(sample, indexDistance: features.normalizedPinchDistance)
+        let approaching = distance.map { $0 < max(0.42, pinchDetector.releaseThreshold) } ?? false
+        let aiming = features.isIndexExtended || pointerAnchor.isThumbPointing(sample)
+        let isExplicitPointerPose = aiming && !features.isMiddleExtended && !features.isOpenPalm
         if let menu = commandMenu.snapshot {
-            // A deliberate transition from the open palm into an index-pointing
-            // pose keeps the menu open for navigation. If tracking still sees a
-            // hand but no actionable finger pose (fist, lowered hand, or a folded
-            // wrist), dismiss immediately instead of leaving a stale overlay up
-            // for the full timeout.
-            if !features.isOpenPalm && !features.isIndexExtended &&
-                !features.isTwoFingerPointing && !features.isPinchApproach {
+            if !features.isOpenPalm && !aiming && !features.isTwoFingerPointing && !approaching {
                 commandMenu.cancel()
                 return
             }
-            if let command = commandMenu.navigate(index: sample.joint(.indexTip, minConfidence: 0.5),
-                isPointing: features.isIndexExtended && !features.isMiddleExtended,
-                pinchDistance: features.normalizedPinchDistance,
-                contactThreshold: pinchDetector.startThreshold, releaseThreshold: pinchDetector.releaseThreshold,
-                timestamp: timestamp) {
+            let finger = commandMenu.contactFinger ?? (anyFingerClick ? contactFinger : nil) ?? .indexTip
+            let liveCursor = systemCursorLocation?() ?? cursorLoc
+            if let command = commandMenu.navigate(cursor: liveCursor, isPointing: isExplicitPointerPose,
+                finger: finger, pinchDistance: distance, contactThreshold: pinchDetector.startThreshold,
+                releaseThreshold: pinchDetector.releaseThreshold, timestamp: timestamp) {
+                separatedFingers.removeAll()
                 delegate?.stateMachine(self, emitCommand: command, at: menu.target, epoch: currentEpoch)
+                return
+            }
+            if commandMenu.isOpen, isExplicitPointerPose, commandMenu.contactFinger == nil,
+               (distance ?? .infinity) > pinchDetector.startThreshold,
+               !isClutchEnabled || clutch.evaluate(isReadyPose: true, timestamp: timestamp) {
+                movePointer(to: cursorLoc, predict: !approaching, epoch: currentEpoch)
             }
             return
         }
@@ -174,7 +223,7 @@ public final class GestureStateMachine: @unchecked Sendable {
 
         // Shortcut contacts are edge-triggered and evaluated before the open-palm
         // path, which could otherwise consume a thumb-to-ring paste gesture.
-        if currentState != .pinchArmed && currentState != .dragging {
+        if !anyFingerClick && currentState != .pinchArmed && currentState != .dragging {
             let wasHolding = shortcutDetector.isHoldingContact
             let shortcut = shortcutDetector.evaluate(sample: sample)
             if wasHolding || shortcutDetector.isHoldingContact {
@@ -190,8 +239,7 @@ public final class GestureStateMachine: @unchecked Sendable {
         }
 
         // Determine if this is an explicit non-palm pose (pointer, scroll, or pinch approach)
-        let isExplicitPointerPose = features.isIndexExtended && !features.isMiddleExtended && !features.isOpenPalm
-        let isExplicitNonPalmPose = isExplicitPointerPose || features.isTwoFingerPointing || features.isPinchApproach
+        let isExplicitNonPalmPose = isExplicitPointerPose || features.isTwoFingerPointing || approaching
 
         // ── 4. Open Palm with grace period ──
         let isEffectiveOpenPalm: Bool
@@ -234,7 +282,7 @@ public final class GestureStateMachine: @unchecked Sendable {
                     return
                 } else {
                     if commandMenu.observePalm(position: PalmSwipeDetector.extractPalmCenter(from: sample), timestamp: timestamp,
-                                               target: lastPointerTarget ?? cursorLoc) {
+                                               target: systemCursorLocation?() ?? lastPointerTarget ?? cursorLoc) {
                         pinchDetector.reset(); scrollDetector.reset(); shortcutDetector.reset()
                         transition(to: .idle)
                         return
@@ -257,9 +305,9 @@ public final class GestureStateMachine: @unchecked Sendable {
         // ── 6. Pinch Detection (BEFORE clutch — pinch must never be blocked) ──
         //    When actively pinching or in drag, always evaluate pinch regardless of clutch.
         let isPinchActive = (currentState == .pinchArmed || currentState == .dragging)
-        if isPinchActive || features.isPinchApproach {
+        if isPinchActive || approaching {
             let pinchDecision = pinchDetector.evaluate(
-                normalizedDistance: features.normalizedPinchDistance,
+                normalizedDistance: distance,
                 currentLocation: cursorLoc,
                 timestamp: timestamp
             )
@@ -309,7 +357,7 @@ public final class GestureStateMachine: @unchecked Sendable {
 
         // ── 7. Engagement Clutch (fast 20ms dwell) ──
         if isClutchEnabled {
-            let isActiveGesturePose = features.isIndexExtended || features.isTwoFingerPointing
+            let isActiveGesturePose = aiming || features.isTwoFingerPointing
             let engaged = clutch.evaluate(isReadyPose: isActiveGesturePose, timestamp: timestamp)
             if !engaged {
                 transition(to: .clutch)
@@ -338,7 +386,7 @@ public final class GestureStateMachine: @unchecked Sendable {
         }
 
         // ── 9. Scroll Inertia Decay ──
-        if !isExplicitPointerPose && !features.isOpenPalm && !features.isPinchApproach,
+        if !isExplicitPointerPose && !features.isOpenPalm && !approaching,
            let last = lastScrollPoseTime, timestamp - last < 0.08 {
             // Freeze during brief ambiguity, rather than interpreting it as a
             // new gesture or sending momentum while finger pose is uncertain.
@@ -360,7 +408,7 @@ public final class GestureStateMachine: @unchecked Sendable {
         // If pinch detector has no active state, evaluate it passively to track pre-pinch approach
         if !isPinchActive {
             let pinchDecision = pinchDetector.evaluate(
-                normalizedDistance: features.normalizedPinchDistance,
+                normalizedDistance: distance,
                 currentLocation: cursorLoc,
                 timestamp: timestamp
             )
@@ -375,8 +423,13 @@ public final class GestureStateMachine: @unchecked Sendable {
             }
         }
 
+        movePointer(to: cursorLoc, predict: !approaching, epoch: currentEpoch)
+    }
+
+    private func movePointer(to location: CGPoint, predict: Bool, epoch: UInt64) {
         transition(to: .pointer)
-        lastPointerTarget = cursorLoc
-        delegate?.stateMachine(self, emitMoveTo: cursorLoc, epoch: currentEpoch)
+        canPredictPointer = predict
+        lastPointerTarget = location
+        delegate?.stateMachine(self, emitMoveTo: location, epoch: epoch)
     }
 }

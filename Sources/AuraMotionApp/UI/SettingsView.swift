@@ -1,9 +1,22 @@
 import SwiftUI
+import CoreVideo
 import AuraMotionCore
 
 public struct SettingsView: View {
     @State private var settings = AppEnvironment.shared.currentSettings
     @State private var permissions = AppEnvironment.shared.permissionsManager.checkPermissions()
+
+    @State private var frameFormat: OSType?
+
+    private var activeCameraFormat: String {
+        switch frameFormat {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: "NV12 (420v)"
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: "NV12 (420f)"
+        case kCVPixelFormatType_32BGRA: "BGRA"
+        case .none: "Waiting for a frame"
+        case let .some(code): String(format: "0x%08X", code)
+        }
+    }
 
     public init() {}
 
@@ -30,6 +43,13 @@ public struct SettingsView: View {
                         Button("Open Settings") {
                             AppEnvironment.shared.permissionsManager.openSystemSettingsAccessibility()
                         }
+                    }
+                }
+                if !permissions.isAccessibilityTrusted {
+                    Text("If AuraMotion is missing from Accessibility, use + to add this copy.")
+                        .font(.callout)
+                    Button("Show AuraMotion in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
                     }
                 }
                 HStack {
@@ -59,6 +79,18 @@ public struct SettingsView: View {
             }
 
             Section(header: Text("Interaction Preferences")) {
+                Picker("Pointer fingertip", selection: $settings.pointerAnchor) {
+                    Text("Thumb").tag(PointerAnchor.thumb)
+                    Text("Index").tag(PointerAnchor.index)
+                }
+                Toggle("Click by pinching any finger to the thumb", isOn: $settings.anyFingerClick)
+                    .help("Turn off to use index for clicking, middle for copy and ring for paste.")
+                Toggle("Smooth pointer and hand preview at 60 Hz", isOn: $settings.smoothPresentation)
+                Picker("Camera format after restart", selection: $settings.cameraPixelLayout) {
+                    Text("BGRA").tag(CameraPixelLayout.bgra)
+                    Text("Native YUV (NV12)").tag(CameraPixelLayout.nativeYUV)
+                }
+                LabeledContent("Active camera format", value: activeCameraFormat)
                 Toggle("Mirror Camera Feed", isOn: $settings.isCameraMirrored)
                 Toggle("Enable Engagement Clutch (Ready Pose)", isOn: $settings.isClutchEnabled)
                 if settings.isClutchEnabled {
@@ -94,14 +126,20 @@ public struct SettingsView: View {
                 }
             }
         }
-        .padding(20)
-        .frame(width: 440, height: 460)
+        .formStyle(.grouped)
+        .padding(8)
+        .frame(minWidth: 440, minHeight: 360)
         .onChange(of: settings) { _, newSettings in
             AppEnvironment.shared.updateSettings(newSettings)
         }
         .onAppear {
             settings = AppEnvironment.shared.currentSettings
             refreshPermissions()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("HUDSnapshotUpdated"))) { note in
+            if let snapshot = note.object as? HUDSnapshot, frameFormat != snapshot.capturePixelFormat {
+                frameFormat = snapshot.capturePixelFormat
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .auraMotionPermissionsDidChange)) { note in
             if let state = note.object as? PermissionsState {

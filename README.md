@@ -57,7 +57,7 @@ Grant the requested access in **System Settings → Privacy & Security**:
 | Accessibility | Control the pointer, send input, and manipulate supported windows. |
 | Input Monitoring | Observe physical input so gesture control can yield to mouse-button presses. Optional for arbitration. |
 
-The app also checks macOS event-posting authorization before injecting input. Its HUD distinguishes camera access, Accessibility trust, and input-control authorization.
+The app also checks macOS event-posting authorization before injecting input. Click a red warning in the HUD to open the corresponding macOS privacy pane. The HUD’s **Settings** button opens AuraMotion preferences even while access is pending.
 
 Local builds are ad-hoc signed. After a rebuild, macOS may require authorization for the updated executable even when an older AuraMotion entry is enabled. If the app reports missing access:
 
@@ -78,22 +78,26 @@ From the AuraMotion menu-bar icon:
 2. Open **Movement Calibration…** to record still, slow, and faster movements and personalize cursor response.
 3. Open **Settings…** to adjust activation delay, mirroring, scroll inertia, palm-swipe behavior, and visual feedback.
 
+In **Settings**, choose **Thumb** or **Index** under **Pointer fingertip**. The default thumb anchor lets you bring a finger to the thumb while keeping the pointer on target. Turn off **Click by pinching any finger to the thumb** to use the middle and ring fingers for clipboard shortcuts. Both preferences can be changed independently.
+
+**Smooth pointer and hand preview at 60 Hz** enables bounded prediction between camera observations. Clicks and commands use observed fingertip contacts. **Camera format after restart** offers BGRA (default) and native YUV (NV12) on supported cameras. Restart AuraMotion to apply the format, then check **Active camera format** to see the format delivered by the camera.
+
 Gesture control pauses during calibration and restores its previous pause state when you save, cancel, or close the calibration window.
 
 ## Gesture guide
 
 | Action | Gesture | Behavior |
 | --- | --- | --- |
-| Move cursor | Extend your index finger and move your hand. | The pointing pose engages cursor control after the configured activation delay. |
-| Left click | Touch your thumb tip to your index fingertip. | A stable contact triggers one click; holding the contact does not repeat it. |
-| Drag | Keep thumb and index touching, then move. | Sustained contact and movement beyond the drag threshold start dragging. Separate the fingers to release. A stationary pinch may click before dragging begins. |
+| Move cursor | Aim with the selected fingertip and move your hand. | Thumb aiming works with the index finger relaxed. The pointing pose engages after the configured activation delay. |
+| Left click | Bring a fingertip to the thumb. | By default any of the four fingers can click. Separate the fingertips before repeating. |
+| Drag | Keep the clicking finger and thumb touching, then move. | Sustained contact and movement beyond the drag threshold start dragging. Separate the fingers to release. A stationary pinch may click before dragging begins. |
 | Scroll | Extend your index and middle fingers together. | Move vertically or horizontally to scroll. Return to index-only pointing to stop scrolling and resume cursor control. |
-| Copy | Touch your thumb tip to your middle fingertip. | Sends Command-C to the active application. |
-| Paste | Touch your thumb tip to your ring fingertip. | Sends Command-V to the active application. |
+| Copy | Touch your thumb tip to your middle fingertip. | Sends Command-C when any-finger clicking is off. |
+| Paste | Touch your thumb tip to your ring fingertip. | Sends Command-V when any-finger clicking is off. |
 | Previous app | Swipe an open palm left. | Sends Command-Shift-Tab in the default app-switching mode. |
 | Next app | Swipe an open palm right. | Sends Command-Tab in the default app-switching mode. |
-| Open command menu | Hold an open palm still for about 0.9 seconds. | Opens the command grid at the current cursor target. |
-| Select a command | Point with your index finger, highlight a tile, then pinch thumb and index. | Confirms the selected command without moving the system cursor during menu navigation. |
+| Open command menu | Hold an open palm still for about 0.9 seconds. | Opens the grid on the display containing the cursor and remembers the original target. |
+| Select a command | Aim the normal system cursor at a tile, then pinch. | The menu uses the same pointer anchor, mapping and smoothing as the desktop. |
 | Dismiss command menu | Fold/lower your hand or move it out of view. | Cancels selection. The menu also times out automatically. |
 | Pause or resume | Use the menu-bar **Pause Gesture Control** toggle. | Suspends or resumes gesture control. |
 
@@ -158,6 +162,8 @@ swift test
 The test suites cover gesture transitions, contact confirmation, cursor stability, hand fusion, calibration, coordinate transforms, event coalescing, stale-event rejection, arbitration, permission handling, lifecycle behavior, and landmark replay.
 
 For live observations, open **Diagnostics & Telemetry…** from the menu bar. It shows capture and inference rates, dropped frames, timing, fingertip confidence, and a raw-versus-filtered horizontal cursor trace. The Capture → Vision result measurement excludes event-output and display delay.
+
+To compare BGRA and NV12 with a visible hand, quit AuraMotion and run `./scripts/compare_live.sh --with-hand` from a terminal with camera access. Keep one hand in view through the four trials. The script reports hand and thumb counts, frame rate, buffer size and timing for each format.
 
 Run the synthetic Vision baseline separately:
 
